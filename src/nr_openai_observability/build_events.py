@@ -8,17 +8,36 @@ import tiktoken
 
 logger = logging.getLogger("nr_openai_observability")
 
+from nr_openai_observability.call_vars import (
+    get_conversation_id,
+    set_response_model,
+    get_response_model
+)
 
-def build_messages_events(messages, model, completion_id, tags={}, start_seq_num=0):
+def build_messages_events(messages, model, completion_id, message_id_override=None, response_id=None, tags={}, start_seq_num=0):
+    completion_id = newrelic.agent.current_span_id()
+    trace_id = newrelic.agent.current_trace_id()
+
+    if model is not None:
+        set_response_model(model)
+
     events = []
     for index, message in enumerate(messages):
+        #Bedrock and non-final messages
+        message_id = str(uuid.uuid4())
+        if message_id_override is not None:
+            #LangChain
+            message_id = message_id_override
+        elif response_id is not None:
+            #OpenAI
+            message_id = str(response_id) + "-" + str(index)
         currMessage = {
             "id": str(uuid.uuid4()),
             "completion_id": completion_id,
             "content": (message.get("content") or "")[:4095],
             "role": message.get("role"),
             "sequence": index + start_seq_num,
-            "model": model,
+            "model": get_response_model(),
             "vendor": "openAI",
             "ingest_source": "PythonSDK",
             **get_trace_details(),
@@ -26,9 +45,7 @@ def build_messages_events(messages, model, completion_id, tags={}, start_seq_num
         currMessage.update(tags)
 
         events.append(currMessage)
-
     return events
-
 
 def _get_rate_limit_data(response_headers):
     def _get_numeric_header(name):
@@ -108,6 +125,7 @@ def build_stream_completion_events(
 
     completion = {
         "id": completion_id,
+        "conversation_id": get_conversation_id(),
         "api_key_last_four_digits": f"sk-{last_chunk.api_key[-4:]}",
         "response_time": int(response_time * 1000),
         "request.model": request.get("model") or request.get("engine"),
@@ -139,10 +157,12 @@ def build_completion_summary(
 ):
     completion = {
         "id": completion_id,
+        "conversation_id": get_conversation_id(),
         "api_key_last_four_digits": f"sk-{response.api_key[-4:]}",
         "response_time": int(response_time * 1000),
         "request.model": request.get("model") or request.get("engine"),
         "response.model": response.model,
+        "response.id": response.id,
         "usage.completion_tokens": response.usage.completion_tokens,
         "usage.total_tokens": response.usage.total_tokens,
         "usage.prompt_tokens": response.usage.prompt_tokens,
@@ -250,3 +270,18 @@ def get_trace_details():
         "transaction_id": transaction_id,
         "transactionId": transaction_id,  # Legacy value from SDK
     }
+    
+def build_ai_feedback_event(category, rating, message_id, conversation_id, request_id, message):
+    feedback_event = {
+        "id": str(uuid.uuid4()),
+        "conversation_id": conversation_id,
+        "message_id": message_id,
+        "request_id": request_id,
+        "rating": rating,
+        "message": message,
+        "category": category,
+        "ingest_source": "PythonSDK",
+        "timestamp": datetime.now(),
+    }
+
+    return feedback_event
