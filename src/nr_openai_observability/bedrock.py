@@ -8,7 +8,7 @@ import traceback
 import uuid
 
 from datetime import datetime
-from nr_openai_observability.monitor import _patched_call, monitor, MessageEventName, SummaryEventName, TransactionBeginEventName
+from nr_openai_observability.monitor import _patched_call, monitor, MessageEventName, SummaryEventName
 from nr_openai_observability.error_handling_decorator import handle_errors
 
 
@@ -72,7 +72,7 @@ def patcher_bedrock_create_completion(original_fn, *args, **kwargs):
 
     try:
         with newrelic.agent.FunctionTrace(
-            name="AI/Bedrock/Chat/Completions/Create", group="", terminal=True
+            name="AI/Bedrock/Chat/Completions/Create", group=""
         ):
             result = original_fn(*args, **kwargs)
             time_delta = time.time() - timestamp
@@ -125,15 +125,13 @@ def handle_bedrock_create_completion(response, time_delta, **kwargs):
             body = json.loads(event_dict['body'])
             event_dict['body'] = body
 
-        (summary, messages, transaction_begin_event) = build_bedrock_events(response, event_dict, time_delta)
+        (summary, messages) = build_bedrock_events(response, event_dict, time_delta)
 
         logger.info(f"Bedrock Reported event dictionary:\n{event_dict}\n")
         logger.info(f'Bedrock summary event: {summary}')
         for event in messages:
             monitor.record_event(event, MessageEventName)
         monitor.record_event(summary, SummaryEventName)
-        monitor.record_event(transaction_begin_event, TransactionBeginEventName)
-
     except Exception as error:
         stacks = traceback.format_exception(error)
         logger.error(f'error writing bedrock event summary: {error}')
@@ -142,12 +140,11 @@ def handle_bedrock_create_completion(response, time_delta, **kwargs):
 
 def build_bedrock_events(response, event_dict, time_delta):
     """
-    returns (summary_event, list(message_events), transaction_event)
+    returns (summary_event, list(message_events))
     """
-    (input_message, input_tokens, response_tokens, stop_reason, temperature, max_tokens) = get_bedrock_info(event_dict)
+    (input_message, input_tokens, response_tokens, stop_reason) = get_bedrock_info(event_dict)
     summary = {}
     messages = []
-    model = "bedrock-unknown"
     trace_id = newrelic.agent.current_trace_id()
     transaction_id = (
         newrelic.agent.current_transaction().guid
@@ -165,13 +162,11 @@ def build_bedrock_events(response, event_dict, time_delta):
 
     if 'modelId' in event_dict:
         completion_id = newrelic.agent.current_span_id() or str(uuid.uuid4())
-        model = event_dict['modelId']
+        model = event_dict['modelId'] or "bedrock-unknown"
+        temperature = 0
         vendor = 'bedrock'
-        message_id = str(uuid.uuid4())
+        max_tokens = 0
         tokens = input_tokens
-
-        if tokens and response_tokens:
-            tokens += response_tokens
 
         if 'vendor' in event_dict:
             vendor = event_dict['vendor']
@@ -182,26 +177,27 @@ def build_bedrock_events(response, event_dict, time_delta):
         if 'body' in event_dict and 'max_tokens_to_sample' in event_dict['body']:
             max_tokens = event_dict['body']['max_tokens_to_sample']
 
-        if 'ResponseMetadata' in response and 'RequestId' in response['ResponseMetadata']:
-            # TODO Is this general to all Bedrock LLMs? Can we move it up?
-            message_id = response['ResponseMetadata']['RequestId']
 
-        # input message
-        messages.append(
-            build_bedrock_result_message(
-                completion_id=completion_id,
-                message_id=message_id,
-                content=input_message[:4095],
-                tokens=input_tokens,
-                role='user',
-                sequence=len(messages),
-                model=model,
-                vendor=vendor,
-                trace_id=trace_id
+        if 'titan' in event_dict['modelId']:
+            # build out the input and output messages for this request
+            message_id = str(uuid.uuid4())
+            if 'ResponseMetadata' in response and 'RequestId' in response['ResponseMetadata']:
+                # TODO Is this general to all Bedrock LLMs? Can we move it up?
+                message_id = response['ResponseMetadata']['RequestId']
+
+            messages.append( # input message
+                build_bedrock_result_message(
+                    completion_id=completion_id,
+                    message_id=message_id,
+                    content=input_message[:4095],
+                    tokens=input_tokens,
+                    role='system',
+                    sequence=len(messages),
+                    model=model,
+                    vendor=vendor
+                )
             )
-        )
 
-        if 'titan' in model:
             # handle 1 or more response messages
             if isinstance(event_dict['results'], list):
                 for result in event_dict['results']:
@@ -215,8 +211,7 @@ def build_bedrock_events(response, event_dict, time_delta):
                             sequence=len(messages),
                             stop_reason=result['completionReason'],
                             model=model,
-                            vendor=vendor,
-                            trace_id=trace_id
+                            vendor=vendor
                         )
                     )
                     logger.info(f"\tresponse_message = {messages[-1]['content'][:30]}")
@@ -233,134 +228,62 @@ def build_bedrock_events(response, event_dict, time_delta):
                         sequence=len(messages),
                         stop_reason=result['completionReason'],
                         model=model,
-                        vendor=vendor,
-                        trace_id=trace_id
+                        vendor=vendor
                     )
                 )
                 logger.info(f"\tresponse_message = {messages[-1]['content'][:30]}")
                 logger.info(f"\tcompletion_reason = {messages[-1]['stop_reason']}")
-        elif 'claude' in model:
-            messages.append(
-                build_bedrock_result_message(
-                    completion_id=completion_id,
-                    message_id=message_id,
-                    content=event_dict['completion'],
-                    role='assistant',
-                    sequence=len(messages),
-                    stop_reason=event_dict['stop_reason'],
-                    model=model,
-                    vendor=vendor,
-                    trace_id=trace_id
-                )
-            )
-        elif 'ai21.j2' in model:
-            for result in event_dict['completions']:
-                messages.append(
-                    build_bedrock_result_message(
-                        completion_id=completion_id,
-                        message_id=message_id,
-                        content=result['data']['text'],
-                        role='assistant',
-                        sequence=len(messages),
-                        stop_reason=result['finishReason']['reason'],
-                        model=model,
-                        vendor=vendor,
-                        trace_id=trace_id
-                    )
-                )
-        elif 'cohere.command' in model:
-            for result in event_dict['generations']:
-                messages.append(
-                    build_bedrock_result_message(
-                        completion_id=completion_id,
-                        message_id=message_id,
-                        content=result['text'],
-                        role='assistant',
-                        sequence=len(messages),
-                        model=model,
-                        vendor=vendor,
-                        trace_id=trace_id
-                    )
-                )
 
-        if len(messages) > 0:
-            messages[-1]["is_final_response"] = True
+            summary = {
+                "id": completion_id,
+                "timestamp": datetime.now(),
+                "response_time": int(time_delta * 1000),
+                "request.model": model,
+                "response.model": model,
+                "usage.completion_tokens": response_tokens,
+                "usage.total_tokens": tokens,
+                "usage.prompt_tokens": input_tokens,
+                "temperature": temperature,
+                "max_tokens": max_tokens,
+                "finish_reason": stop_reason,
+                "api_type": None,
+                "vendor": vendor,
+                "ingest_source": "PythonSDK",
+                "number_of_messages": len(messages), 
+                "trace.id": trace_id,
+                "transactionId": transaction_id,
+                "response": messages[-1]['content'][:4095],
+                # "organization": response.organization,
+                # "api_version": response_headers.get("openai-version"),
+            }
 
-        summary = {
-            "id": completion_id,
-            "timestamp": datetime.now(),
-            "response_time": int(time_delta * 1000),
-            "model": model,
-            "request.model": model,
-            "response.model": model,
-            "temperature": temperature,
-            "api_type": None,
-            "vendor": vendor,
-            "ingest_source": "PythonSDK",
-            "number_of_messages": len(messages), 
-            "trace.id": trace_id,
-            "transactionId": transaction_id,
-            "response": messages[-1]['content'][:4095],
-        }
-
-        if stop_reason:
-            summary["finish_reason"] = stop_reason
-        if response_tokens:
-            summary["usage.completion_tokens"] = response_tokens
-        if tokens:
-            summary["usage.total_tokens"] = tokens
-        if input_tokens:
-            summary["usage.prompt_tokens"] = input_tokens
-        if max_tokens:
-            summary["max_tokens"] = max_tokens
-
-        transaction_begin_event = {
-            "human_prompt": messages[0]['content'],
-            "vendor": vendor,
-            "trace.id": trace_id,
-            "ingest_source": "PythonAgentHybrid"
-        }
-
-    return (summary, messages, transaction_begin_event)
+    return (summary, messages)
 
 
 
-def build_bedrock_result_message(completion_id, message_id, content, tokens=None, role=None, sequence=None, stop_reason=None, model=None, vendor=None, trace_id=None):
-    message = {
+def build_bedrock_result_message(completion_id, message_id, content, tokens=None, role=None, sequence=None, stop_reason=None, model=None, vendor=None):
+    return {
         "id": message_id,
         "content": content[:4095],
+        "tokens": tokens,
         "role": role,
         "completion_id": completion_id,
         "sequence": sequence,
+        "stop_reason": stop_reason,
         "model": model,
         "vendor": vendor,
         "ingest_source": "PythonSDK",
     }
 
-    if tokens:
-        message["tokens"] = tokens
-    if stop_reason:
-        message["stop_reason"] = stop_reason
-    if trace_id:
-        message["trace.id"] = trace_id
-
-    return message
-
 def get_bedrock_info(event_dict):
     """
-    (input_message, input_tokens, response_tokens, completion_reason, default_temp, max_tokens) =
-
-    default temperature and max tokens per model was found at https://docs.aws.amazon.com/bedrock/latest/userguide/model-parameters.html
+    (input_message, input_tokens, response_tokens, completion_reason) = 
     """
-    (input_message, input_tokens, response_tokens, stop_reason, default_temp, default_max_tokens) = (None, None, None, None, 0, 0)
+    (input_message, input_tokens, response_tokens, stop_reason) = (None, None, None, None)
 
     if 'modelId' in event_dict:
-        model = event_dict['modelId']
-
-        if 'titan' in model:
+        if 'titan' in event_dict['modelId']:
             response_tokens = 0
-            default_temp = 0
-            default_max_tokens = 512
 
             if isinstance(event_dict['results'], list):
                 for result in event_dict['results']:
@@ -369,24 +292,12 @@ def get_bedrock_info(event_dict):
 
             input_message = event_dict['body']['inputText']
             input_tokens = event_dict['inputTextTokenCount']
-        if 'claude' in model:
-            input_message = event_dict['body']['prompt']
-            stop_reason = event_dict['stop_reason']
-            default_temp = 0.5
-            default_max_tokens = 200
-        if 'ai21.j2' in model:
-            input_message = event_dict['prompt.text']
-            default_temp = 0.5
-            default_max_tokens = 200
+        if 'claude' in event_dict['modelId']:
+            pass
+        if 'ai21.j2' in event_dict['modelId']:
+            pass
 
-            for result in event_dict['completions']:
-                stop_reason = result['finishReason']['reason'] # keep the last one
-        if 'cohere.command' in model:
-            input_message = event_dict['prompt']
-            default_temp = 0.9
-            default_max_tokens = 20
-
-    return (input_message, input_tokens, response_tokens, stop_reason, default_temp, default_max_tokens)
+    return (input_message, input_tokens, response_tokens, stop_reason)
 
 
 def bind__create_api_method(py_operation_name, operation_name, service_model,
